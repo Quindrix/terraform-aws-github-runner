@@ -9,7 +9,7 @@ variable "vpc_id" {
 }
 
 variable "subnet_ids" {
-  description = "List of subnets in which the action runner instances will be launched. The subnets need to exist in the configured VPC (`vpc_id`), and must reside in different availability zones (see https://github.com/github-aws-runners/terraform-aws-github-runner/issues/2904)"
+  description = "List of subnets in which the action runner instances will be launched. The subnets must exist in the configured VPC (`vpc_id`). Multiple subnets in the same Availability Zone are supported; each EC2 Fleet request uses at most one subnet per Availability Zone."
   type        = list(string)
 }
 

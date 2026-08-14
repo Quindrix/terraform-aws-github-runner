@@ -9,6 +9,7 @@ import {
   DeleteTagsCommand,
   DescribeInstancesCommand,
   type DescribeInstancesResult,
+  DescribeSubnetsCommand,
   EC2Client,
   FleetOnDemandAllocationStrategy,
   RunInstancesCommand,
@@ -35,6 +36,15 @@ const REPO_NAME = `${ORG_NAME}/some-amazing-library`;
 const ENVIRONMENT = 'unit-test-environment';
 const RUNNER_NAME_PREFIX = '';
 const RUNNER_TYPES: RunnerType[] = ['Repo', 'Org'];
+
+function mockDefaultSubnets() {
+  mockEC2Client.on(DescribeSubnetsCommand).resolves({
+    Subnets: [
+      { SubnetId: 'subnet-123', AvailabilityZoneId: 'euw1-az1' },
+      { SubnetId: 'subnet-456', AvailabilityZoneId: 'euw1-az2' },
+    ],
+  });
+}
 
 mockEC2Client.on(DescribeInstancesCommand).resolves({});
 
@@ -338,6 +348,7 @@ describe('create runner', () => {
     mockEC2Client.reset();
     mockSSMClient.reset();
 
+    mockDefaultSubnets();
     mockEC2Client.on(CreateFleetCommand).resolves({ Instances: [{ InstanceIds: ['i-1234'] }] });
     mockSSMClient.on(GetParameterCommand).resolves({});
   });
@@ -345,12 +356,88 @@ describe('create runner', () => {
   it.each(RUNNER_TYPES)('calls create fleet of 1 instance with the default config for %p', async (type: RunnerType) => {
     await createRunner(createRunnerConfig({ ...defaultRunnerConfig, type: type }));
 
+    expect(mockEC2Client).toHaveReceivedCommandWith(DescribeSubnetsCommand, {
+      SubnetIds: ['subnet-123', 'subnet-456'],
+    });
+    expect(mockEC2Client).toHaveReceivedCommandTimes(CreateFleetCommand, 1);
     expect(mockEC2Client).toHaveReceivedCommandWith(CreateFleetCommand, {
       ...expectedCreateFleetRequest({
         ...defaultExpectedFleetRequestValues,
         type: type,
       }),
     });
+  });
+
+  it('partitions batch capacity across subnet sets that contain at most one subnet per Availability Zone', async () => {
+    mockEC2Client.on(DescribeSubnetsCommand).resolves({
+      Subnets: [
+        { SubnetId: 'subnet-123', AvailabilityZoneId: 'euw1-az1' },
+        { SubnetId: 'subnet-456', AvailabilityZoneId: 'euw1-az1' },
+        { SubnetId: 'subnet-789', AvailabilityZoneId: 'euw1-az2' },
+      ],
+    });
+    mockEC2Client
+      .on(CreateFleetCommand)
+      .resolvesOnce({ Instances: [{ InstanceIds: ['i-1234'] }] })
+      .resolvesOnce({ Instances: [{ InstanceIds: ['i-5678'] }] });
+
+    const result = await createRunner({
+      ...createRunnerConfig(defaultRunnerConfig),
+      numberOfRunners: 2,
+      subnets: ['subnet-123', 'subnet-456', 'subnet-789'],
+    });
+
+    expect(result).toEqual({
+      instances: ['i-1234', 'i-5678'],
+      retryableErrorCount: 0,
+      nonRetryableErrorCount: 0,
+    });
+    expect(mockEC2Client).toHaveReceivedCommandTimes(CreateFleetCommand, 2);
+    const subnetSets = mockEC2Client
+      .commandCalls(CreateFleetCommand)
+      .map((call) => [
+        ...new Set(
+          call.args[0].input.LaunchTemplateConfigs?.[0].Overrides?.map((override) => override.SubnetId).filter(Boolean),
+        ),
+      ]);
+    expect(subnetSets.map((subnets) => subnets.sort()).sort()).toEqual(
+      [
+        ['subnet-123', 'subnet-789'],
+        ['subnet-456', 'subnet-789'],
+      ].sort(),
+    );
+  });
+
+  it('carries retryable subnet address failures to the next same-AZ subnet set', async () => {
+    mockEC2Client.on(DescribeSubnetsCommand).resolves({
+      Subnets: [
+        { SubnetId: 'subnet-123', AvailabilityZoneId: 'euw1-az1' },
+        { SubnetId: 'subnet-456', AvailabilityZoneId: 'euw1-az1' },
+      ],
+    });
+    mockEC2Client
+      .on(CreateFleetCommand)
+      .resolvesOnce({ Errors: [{ ErrorCode: 'InsufficientFreeAddressesInSubnet' }] })
+      .resolvesOnce({ Instances: [{ InstanceIds: ['i-1234'] }] });
+
+    const result = await createRunner(
+      createRunnerConfig({
+        ...defaultRunnerConfig,
+        scaleErrors: [...defaultRunnerConfig.scaleErrors, 'InsufficientFreeAddressesInSubnet'],
+      }),
+    );
+
+    expect(result).toEqual({
+      instances: ['i-1234'],
+      retryableErrorCount: 0,
+      nonRetryableErrorCount: 0,
+    });
+    expect(mockEC2Client).toHaveReceivedCommandTimes(CreateFleetCommand, 2);
+    const attemptedSubnets = mockEC2Client
+      .commandCalls(CreateFleetCommand)
+      .map((call) => call.args[0].input.LaunchTemplateConfigs?.[0].Overrides?.[0].SubnetId)
+      .sort();
+    expect(attemptedSubnets).toEqual(['subnet-123', 'subnet-456']);
   });
 
   it('calls create fleet of 2 instances with the correct config for org ', async () => {
@@ -545,6 +632,7 @@ describe('create runner', () => {
       },
     });
 
+    expect(mockEC2Client).not.toHaveReceivedCommand(DescribeSubnetsCommand);
     expect(mockEC2Client).toHaveReceivedCommandWith(CreateFleetCommand, {
       LaunchTemplateConfigs: [
         {
@@ -767,6 +855,7 @@ describe('create runner with errors', () => {
     mockEC2Client.reset();
     mockSSMClient.reset();
 
+    mockDefaultSubnets();
     mockSSMClient.on(PutParameterCommand).resolves({});
     mockSSMClient.on(GetParameterCommand).resolves({});
     mockEC2Client.on(CreateFleetCommand).resolves({ Instances: [] });
@@ -1013,6 +1102,7 @@ describe('create runner with errors fail over to OnDemand', () => {
     mockEC2Client.reset();
     mockSSMClient.reset();
 
+    mockDefaultSubnets();
     mockSSMClient.on(PutParameterCommand).resolves({});
     mockSSMClient.on(GetParameterCommand).resolves({});
     mockEC2Client.on(CreateFleetCommand).resolves({ Instances: [] });
@@ -1032,7 +1122,7 @@ describe('create runner with errors fail over to OnDemand', () => {
     expect(mockEC2Client).toHaveReceivedCommandTimes(CreateFleetCommand, 2);
 
     // first call with spot failure
-    expect(mockEC2Client).toHaveReceivedNthCommandWith(1, CreateFleetCommand, {
+    expect(mockEC2Client).toHaveReceivedNthSpecificCommandWith(1, CreateFleetCommand, {
       ...expectedCreateFleetRequest({
         ...defaultExpectedFleetRequestValues,
         totalTargetCapacity: 1,
@@ -1041,7 +1131,7 @@ describe('create runner with errors fail over to OnDemand', () => {
     });
 
     // second call with with OnDemand fallback, allocation strategy defaults to lowest-price
-    expect(mockEC2Client).toHaveReceivedNthCommandWith(2, CreateFleetCommand, {
+    expect(mockEC2Client).toHaveReceivedNthSpecificCommandWith(2, CreateFleetCommand, {
       ...expectedCreateFleetRequest({
         ...defaultExpectedFleetRequestValues,
         totalTargetCapacity: 1,
@@ -1079,7 +1169,7 @@ describe('create runner with errors fail over to OnDemand', () => {
     expect(mockEC2Client).toHaveReceivedCommandTimes(CreateFleetCommand, 2);
 
     // first call with spot failure
-    expect(mockEC2Client).toHaveReceivedNthCommandWith(1, CreateFleetCommand, {
+    expect(mockEC2Client).toHaveReceivedNthSpecificCommandWith(1, CreateFleetCommand, {
       ...expectedCreateFleetRequest({
         ...defaultExpectedFleetRequestValues,
         totalTargetCapacity: 2,
@@ -1088,7 +1178,7 @@ describe('create runner with errors fail over to OnDemand', () => {
     });
 
     // second call with with OnDemand failback, capacity is reduced by 1, allocation strategy defaults to lowest-price
-    expect(mockEC2Client).toHaveReceivedNthCommandWith(2, CreateFleetCommand, {
+    expect(mockEC2Client).toHaveReceivedNthSpecificCommandWith(2, CreateFleetCommand, {
       ...expectedCreateFleetRequest({
         ...defaultExpectedFleetRequestValues,
         totalTargetCapacity: 1,
@@ -1113,7 +1203,7 @@ describe('create runner with errors fail over to OnDemand', () => {
     expect(mockEC2Client).toHaveReceivedCommandTimes(CreateFleetCommand, 1);
 
     // first call with spot failure
-    expect(mockEC2Client).toHaveReceivedNthCommandWith(1, CreateFleetCommand, {
+    expect(mockEC2Client).toHaveReceivedNthSpecificCommandWith(1, CreateFleetCommand, {
       ...expectedCreateFleetRequest({
         ...defaultExpectedFleetRequestValues,
         totalTargetCapacity: 2,
@@ -1328,6 +1418,7 @@ describe('create runner with useDedicatedHost', () => {
     mockEC2Client.reset();
     mockSSMClient.reset();
 
+    mockDefaultSubnets();
     mockEC2Client.on(RunInstancesCommand).resolves({
       Instances: [{ InstanceId: 'i-dedicated-1' }],
     });
@@ -1344,6 +1435,7 @@ describe('create runner with useDedicatedHost', () => {
     });
     expect(mockEC2Client).toHaveReceivedCommand(RunInstancesCommand);
     expect(mockEC2Client).not.toHaveReceivedCommand(CreateFleetCommand);
+    expect(mockEC2Client).not.toHaveReceivedCommand(DescribeSubnetsCommand);
   });
 
   it('uses CreateFleet when useDedicatedHost is false', async () => {
